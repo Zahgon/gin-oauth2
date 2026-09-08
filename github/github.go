@@ -12,9 +12,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/session"
 	"github.com/golang/glog"
 
 	"github.com/google/go-github/github"
@@ -28,10 +27,20 @@ type Credentials struct {
 	ClientSecret string `json:"secret"`
 }
 
+const (
+	// sessionContextKey is the key the Session() middleware uses to
+	// hand the session of the current request over to the handlers.
+	sessionContextKey = "ginoauth_github_session_ctx"
+
+	// defaultSessionName is the cookie name used until Session() rebinds
+	// the store to an application specific name.
+	defaultSessionName = "session_id"
+)
+
 var (
 	conf  *oauth2.Config
 	state string
-	store sessions.Store
+	store *session.Store
 )
 
 func randToken() string {
@@ -42,8 +51,31 @@ func randToken() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+// newStore creates a session store that reads the session id from the
+// cookie with the given name.
+func newStore(name string) *session.Store {
+	return session.New(session.Config{
+		KeyLookup:      "cookie:" + name,
+		CookieHTTPOnly: true,
+	})
+}
+
+// currentSession returns the session of the current request. It uses the
+// session provided by the Session() middleware, if it was registered.
+func currentSession(ctx *fiber.Ctx) (*session.Session, error) {
+	if s, ok := ctx.Locals(sessionContextKey).(*session.Session); ok {
+		return s, nil
+	}
+	return store.Get(ctx)
+}
+
+// Setup the authorization path.
+//
+// The secret is kept for API compatibility. Fiber's session middleware
+// stores the session data server side and references it by an
+// unguessable session id, so no signing secret is required.
 func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
-	store = cookie.NewStore(secret)
+	store = newStore(defaultSessionName)
 	var c Credentials
 	file, err := os.ReadFile(credFile)
 	if err != nil {
@@ -62,16 +94,33 @@ func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
 	}
 }
 
-func Session(name string) gin.HandlerFunc {
-	return sessions.Sessions(name, store)
+// Session returns a middleware that stores the session identified by the
+// cookie name in the request context, such that LoginHandler and Auth can
+// use it.
+func Session(name string) fiber.Handler {
+	store = newStore(name)
+
+	return func(ctx *fiber.Ctx) error {
+		sess, err := store.Get(ctx)
+		if err != nil {
+			return err
+		}
+		ctx.Locals(sessionContextKey, sess)
+
+		return ctx.Next()
+	}
 }
 
-func LoginHandler(ctx *gin.Context) {
+func LoginHandler(ctx *fiber.Ctx) error {
 	state = randToken()
-	session := sessions.Default(ctx)
+	session, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
 	session.Set("state", state)
 	session.Save()
-	ctx.Writer.Write([]byte("<html><title>Golang Github</title> <body> <a href='" + GetLoginURL(state) + "'><button>Login with GitHub!</button> </a> </body></html>"))
+
+	return ctx.Type("html").SendString("<html><title>Golang Github</title> <body> <a href='" + GetLoginURL(state) + "'><button>Login with GitHub!</button> </a> </body></html>")
 }
 
 func GetLoginURL(state string) string {
@@ -90,8 +139,8 @@ func init() {
 	gob.Register(AuthUser{})
 }
 
-func Auth() gin.HandlerFunc {
-	return func(ctx *gin.Context) {
+func Auth() fiber.Handler {
+	return func(ctx *fiber.Ctx) error {
 		var (
 			ok       bool
 			authUser AuthUser
@@ -99,31 +148,30 @@ func Auth() gin.HandlerFunc {
 		)
 
 		// Handle the exchange code to initiate a transport.
-		session := sessions.Default(ctx)
+		session, err := currentSession(ctx)
+		if err != nil {
+			return err
+		}
 		mysession := session.Get("ginoauthgh")
 		if authUser, ok = mysession.(AuthUser); ok {
-			ctx.Set("user", authUser)
-			ctx.Next()
-			return
+			ctx.Locals("user", authUser)
+			return ctx.Next()
 		}
 
 		retrievedState := session.Get("state")
 		if retrievedState != ctx.Query("state") {
-			ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("invalid session state: %s", retrievedState))
-			return
+			return fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("invalid session state: %s", retrievedState))
 		}
 
 		stdctx := context.Background()
 		tok, err := conf.Exchange(stdctx, ctx.Query("code"))
 		if err != nil {
-			ctx.AbortWithError(http.StatusBadRequest, fmt.Errorf("failed to do exchange: %w", err))
-			return
+			return fiber.NewError(http.StatusBadRequest, fmt.Sprintf("failed to do exchange: %v", err))
 		}
 		client := github.NewClient(conf.Client(stdctx, tok))
 		user, _, err = client.Users.Get(stdctx, "")
 		if err != nil {
-			ctx.AbortWithError(http.StatusBadRequest, fmt.Errorf("failed to get user: %w", err))
-			return
+			return fiber.NewError(http.StatusBadRequest, fmt.Sprintf("failed to get user: %v", err))
 		}
 		// Protection: fields used in userinfo might be nil-pointers
 		authUser = AuthUser{
@@ -133,13 +181,15 @@ func Auth() gin.HandlerFunc {
 		}
 
 		// save userinfo, which could be used in Handlers
-		ctx.Set("user", authUser)
+		ctx.Locals("user", authUser)
 
 		// populate cookie
 		session.Set("ginoauthgh", authUser)
 		if err := session.Save(); err != nil {
 			glog.Errorf("Failed to save session: %v", err)
 		}
+
+		return ctx.Next()
 	}
 }
 

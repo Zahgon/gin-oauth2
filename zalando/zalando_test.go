@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -12,7 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
 
 	ginoauth2 "github.com/zalando/gin-oauth2"
 	"golang.org/x/oauth2"
@@ -67,6 +67,18 @@ func TestRequestTeamInfo(t *testing.T) {
 	fmt.Printf("%+v\n", data)
 }
 
+// newTestContext creates a fiber.Ctx that can be handed to the
+// AccessCheckFunctions under test.
+func newTestContext(t *testing.T) *fiber.Ctx {
+	t.Helper()
+
+	app := fiber.New()
+	ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
+	t.Cleanup(func() { app.ReleaseCtx(ctx) })
+
+	return ctx
+}
+
 func TestScopeCheck(t *testing.T) {
 	// given
 	tc := &ginoauth2.TokenContainer{
@@ -83,7 +95,7 @@ func TestScopeCheck(t *testing.T) {
 		GrantType: "password",
 		Realm:     "/services",
 	}
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx := newTestContext(t)
 
 	// when
 	checkFn := ScopeCheck("name", "my-scope-1")
@@ -92,12 +104,12 @@ func TestScopeCheck(t *testing.T) {
 	// then
 	assert.True(t, result)
 
-	scopeVal, scopeOk := ctx.Get("my-scope-1")
-	assert.True(t, scopeOk)
+	scopeVal := ctx.Locals("my-scope-1")
+	assert.NotNil(t, scopeVal)
 	assert.Equal(t, true, scopeVal)
 
-	uid, uidOk := ctx.Get("uid")
-	assert.True(t, uidOk)
+	uid := ctx.Locals("uid")
+	assert.NotNil(t, uid)
 	assert.Equal(t, "stups_marilyn-updater", uid)
 }
 
@@ -117,7 +129,7 @@ func TestScopeAndCheck(t *testing.T) {
 		GrantType: "password",
 		Realm:     "/services",
 	}
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx := newTestContext(t)
 
 	// when
 	checkFn := ScopeAndCheck("name", "uid", "my-scope-2")
@@ -126,10 +138,10 @@ func TestScopeAndCheck(t *testing.T) {
 	// then
 	assert.True(t, result)
 
-	uidVal, uidOk := ctx.Get("uid")
-	scopeVal, scopeOk := ctx.Get("my-scope-2")
-	assert.True(t, uidOk)
+	uidVal := ctx.Locals("uid")
+	scopeVal := ctx.Locals("my-scope-2")
+	assert.NotNil(t, uidVal)
 	assert.Equal(t, "stups_marilyn-updater", uidVal)
-	assert.True(t, scopeOk)
+	assert.NotNil(t, scopeVal)
 	assert.Equal(t, true, scopeVal)
 }

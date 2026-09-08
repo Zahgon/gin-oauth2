@@ -1,5 +1,5 @@
 // Package ginoauth2 implements an OAuth2 based authorization
-// middleware for the Gin https://github.com/gin-gonic/gin
+// middleware for the Fiber https://github.com/gofiber/fiber
 // webframework.
 //
 // Example:
@@ -8,9 +8,10 @@
 //	import (
 //		"flag"
 //		"time"
-//		"github.com/gin-gonic/gin"
+//		"github.com/gofiber/fiber/v2"
+//		"github.com/gofiber/fiber/v2/middleware/logger"
+//		"github.com/gofiber/fiber/v2/middleware/recover"
 //		"github.com/golang/glog"
-//		"github.com/szuecs/gin-glog"
 //		"github.com/zalando/gin-oauth2"
 //		"golang.org/x/oauth2"
 //	)
@@ -20,36 +21,36 @@
 //		TokenURL: "https://oauth2.corp.com/corp/oauth2/tokeninfo",
 //	}
 //
-//	func UidCheck(tc *TokenContainer, ctx *gin.Context) bool {
+//	func UidCheck(tc *TokenContainer, ctx *fiber.Ctx) bool {
 //	 uid := tc.Scopes["uid"].(string)
 //	 if uid != "sszuecs" {
 //	  return false
 //	 }
-//	 ctx.Set("uid", uid)
+//	 ctx.Locals("uid", uid)
 //	 return true
 //	}
 //
 //	func main() {
 //		flag.Parse()
-//		router := gin.New()
-//		router.Use(ginglog.Logger(3 * time.Second))
-//		router.Use(gin.Recovery())
+//		router := fiber.New()
+//		router.Use(logger.New())
+//		router.Use(recover.New())
 //
 //		ginoauth2.VarianceTimer = 300 * time.Millisecond // defaults to 30s
 //
 //		public := router.Group("/api")
-//		public.GET("/", func(c *gin.Context) {
-//			c.JSON(200, gin.H{"message": "Hello to public world"})
+//		public.Get("/", func(c *fiber.Ctx) error {
+//			return c.JSON(fiber.Map{"message": "Hello to public world"})
 //		})
 //
 //		private := router.Group("/api/private")
 //		private.Use(ginoauth2.Auth(UidCheck, OAuth2Endpoint))
-//		private.GET("/", func(c *gin.Context) {
-//			c.JSON(200, gin.H{"message": "Hello from private"})
+//		private.Get("/", func(c *fiber.Ctx) error {
+//			return c.JSON(fiber.Map{"message": "Hello from private"})
 //		})
 //
 //		glog.Info("bootstrapped application")
-//		router.Run(":8081")
+//		router.Listen(":8081")
 package ginoauth2
 
 import (
@@ -63,7 +64,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
 	"golang.org/x/oauth2"
 )
 
@@ -86,7 +87,7 @@ type TokenContainer struct {
 
 // AccessCheckFunction is a function that checks if a given token grants
 // access.
-type AccessCheckFunction func(tc *TokenContainer, ctx *gin.Context) bool
+type AccessCheckFunction func(tc *TokenContainer, ctx *fiber.Ctx) bool
 
 type Options struct {
 	Endpoint            oauth2.Endpoint
@@ -101,8 +102,8 @@ func maskAccessToken(a interface{}) string {
 	return s
 }
 
-func extractToken(r *http.Request) (*oauth2.Token, error) {
-	hdr := r.Header.Get("Authorization")
+func extractToken(ctx *fiber.Ctx) (*oauth2.Token, error) {
+	hdr := ctx.Get(fiber.HeaderAuthorization)
 	if hdr == "" {
 		return nil, errors.New("no authorization header")
 	}
@@ -212,26 +213,21 @@ func GetTokenContainer(token *oauth2.Token) (*TokenContainer, error) {
 	return getTokenContainerForToken(Options{}, token)
 }
 
-func getTokenContainer(o Options, ctx *gin.Context) (*TokenContainer, bool) {
-	var oauthToken *oauth2.Token
-	var tc *TokenContainer
-	var err error
+// denyUnauthenticated answers a request that carries no usable token.
+func denyUnauthenticated(ctx *fiber.Ctx, o Options, start time.Time, reason string) error {
+	// set LOCATION header to auth endpoint such that the user can easily get a new access-token
+	ctx.Set(fiber.HeaderLocation, o.Endpoint.AuthURL)
+	infofv2("[Gin-OAuth] %12v %s access not allowed", time.Since(start), ctx.Path())
 
-	if oauthToken, err = extractToken(ctx.Request); err != nil {
-		errorf("[Gin-OAuth] Can not extract oauth2.Token, caused by: %s", err)
-		return nil, false
-	}
-	if !oauthToken.Valid() {
-		infof("[Gin-OAuth] Invalid Token - nil or expired")
-		return nil, false
-	}
+	return fiber.NewError(http.StatusUnauthorized, reason)
+}
 
-	if tc, err = getTokenContainerForToken(o, oauthToken); err != nil {
-		errorf("[Gin-OAuth] Can not extract TokenContainer, caused by: %s", err)
-		return nil, false
-	}
+// denyOvertime answers a request whose authorization check did not finish
+// within VarianceTimer.
+func denyOvertime(ctx *fiber.Ctx, start time.Time) error {
+	infofv2("[Gin-OAuth] %12v %s overtime", time.Since(start), ctx.Path())
 
-	return tc, true
+	return fiber.NewError(http.StatusGatewayTimeout, "authorization check overtime")
 }
 
 // Valid validates that the AccessToken within TokenContainer is not
@@ -252,13 +248,13 @@ func (t *TokenContainer) Valid() bool {
 //		        TokenURL: "https://oauth2.corp.com/corp/oauth2/tokeninfo",
 //	     }
 //	     var acl []ginoauth2.AccessTuple = []ginoauth2.AccessTuple{{"employee", 1070, "sszuecs"}, {"employee", 1114, "njuettner"}}
-//	     router := gin.Default()
+//	     router := fiber.New()
 //		private := router.Group("")
 //		private.Use(ginoauth2.Auth(ginoauth2.UidCheck, ginoauth2.endpoints))
-//		private.GET("/api/private", func(c *gin.Context) {
-//			c.JSON(200, gin.H{"message": "Hello from private"})
+//		private.Get("/api/private", func(c *fiber.Ctx) error {
+//			return c.JSON(fiber.Map{"message": "Hello from private"})
 //		})
-func Auth(accessCheckFunction AccessCheckFunction, endpoints oauth2.Endpoint) gin.HandlerFunc {
+func Auth(accessCheckFunction AccessCheckFunction, endpoints oauth2.Endpoint) fiber.Handler {
 	return AuthChain(endpoints, accessCheckFunction)
 }
 
@@ -272,73 +268,93 @@ func Auth(accessCheckFunction AccessCheckFunction, endpoints oauth2.Endpoint) gi
 //		        TokenURL: "https://oauth2.corp.com/corp/oauth2/tokeninfo",
 //	     }
 //	     var acl []ginoauth2.AccessTuple = []ginoauth2.AccessTuple{{"employee", 1070, "sszuecs"}, {"employee", 1114, "njuettner"}}
-//	     router := gin.Default()
+//	     router := fiber.New()
 //		    private := router.Group("")
 //	     checkChain := []AccessCheckFunction{
 //	         ginoauth2.UidCheck,
 //	         ginoauth2.GroupCheck,
 //	     }
 //	     private.Use(ginoauth2.AuthChain(checkChain, ginoauth2.endpoints))
-//	     private.GET("/api/private", func(c *gin.Context) {
-//	         c.JSON(200, gin.H{"message": "Hello from private"})
+//	     private.Get("/api/private", func(c *fiber.Ctx) error {
+//	         return c.JSON(fiber.Map{"message": "Hello from private"})
 //	     })
-func AuthChain(endpoint oauth2.Endpoint, accessCheckFunctions ...AccessCheckFunction) gin.HandlerFunc {
+func AuthChain(endpoint oauth2.Endpoint, accessCheckFunctions ...AccessCheckFunction) fiber.Handler {
 	return AuthChainOptions(Options{Endpoint: endpoint}, accessCheckFunctions...)
 }
 
-func AuthChainOptions(o Options, accessCheckFunctions ...AccessCheckFunction) gin.HandlerFunc {
+func AuthChainOptions(o Options, accessCheckFunctions ...AccessCheckFunction) fiber.Handler {
 	// init
 	AuthInfoURL = o.Endpoint.TokenURL
 	// middleware
-	return func(ctx *gin.Context) {
+	return func(ctx *fiber.Ctx) error {
 		t := time.Now()
-		varianceControl := make(chan bool, 1)
 
-		go func() {
-			tokenContainer, ok := getTokenContainer(o, ctx)
-			if !ok {
-				// set LOCATION header to auth endpoint such that the user can easily get a new access-token
-				ctx.Writer.Header().Set("Location", o.Endpoint.AuthURL)
-				ctx.AbortWithError(http.StatusUnauthorized, errors.New("no token in context"))
-				varianceControl <- false
-				return
-			}
-
-			if !tokenContainer.Valid() {
-				// set LOCATION header to auth endpoint such that the user can easily get a new access-token
-				ctx.Writer.Header().Set("Location", o.Endpoint.AuthURL)
-				ctx.AbortWithError(http.StatusUnauthorized, errors.New("invalid Token"))
-				varianceControl <- false
-				return
-			}
-
-			for i, fn := range accessCheckFunctions {
-				if fn(tokenContainer, ctx) {
-					varianceControl <- true
-					break
-				}
-
-				if len(accessCheckFunctions)-1 == i {
-					ctx.AbortWithError(http.StatusForbidden, errors.New("access to the Resource is forbidden"))
-					varianceControl <- false
-					return
-				}
-			}
-		}()
-
-		select {
-		case ok := <-varianceControl:
-			if !ok {
-				infofv2("[Gin-OAuth] %12v %s access not allowed", time.Since(t), ctx.Request.URL.Path)
-				return
-			}
-		case <-time.After(VarianceTimer):
-			ctx.AbortWithError(http.StatusGatewayTimeout, errors.New("authorization check overtime"))
-			infofv2("[Gin-OAuth] %12v %s overtime", time.Since(t), ctx.Request.URL.Path)
-			return
+		// Fiber hands the request context back to its pool as soon as
+		// the handler returns, so nothing that may outlive the handler
+		// is allowed to touch ctx. The token is therefore read from the
+		// request up front and the access checks are run in this
+		// goroutine; only the token info request, which is the call
+		// that can block on a remote service, runs concurrently to the
+		// VarianceTimer.
+		oauthToken, err := extractToken(ctx)
+		if err != nil {
+			errorf("[Gin-OAuth] Can not extract oauth2.Token, caused by: %s", err)
+			return denyUnauthenticated(ctx, o, t, "no token in context")
 		}
 
-		infofv2("[Gin-OAuth] %12v %s access allowed", time.Since(t), ctx.Request.URL.Path)
+		if !oauthToken.Valid() {
+			infof("[Gin-OAuth] Invalid Token - nil or expired")
+			return denyUnauthenticated(ctx, o, t, "no token in context")
+		}
+
+		varianceControl := make(chan *TokenContainer, 1)
+		go func() {
+			tc, err := getTokenContainerForToken(o, oauthToken)
+			if err != nil {
+				errorf("[Gin-OAuth] Can not extract TokenContainer, caused by: %s", err)
+				varianceControl <- nil
+				return
+			}
+			varianceControl <- tc
+		}()
+
+		var tokenContainer *TokenContainer
+		select {
+		case tokenContainer = <-varianceControl:
+			if tokenContainer == nil {
+				return denyUnauthenticated(ctx, o, t, "no token in context")
+			}
+		case <-time.After(VarianceTimer):
+			return denyOvertime(ctx, t)
+		}
+
+		if !tokenContainer.Valid() {
+			return denyUnauthenticated(ctx, o, t, "invalid Token")
+		}
+
+		deadline := t.Add(VarianceTimer)
+		for i, fn := range accessCheckFunctions {
+			if time.Now().After(deadline) {
+				return denyOvertime(ctx, t)
+			}
+
+			if fn(tokenContainer, ctx) {
+				infofv2("[Gin-OAuth] %12v %s access allowed", time.Since(t), ctx.Path())
+
+				return ctx.Next()
+			}
+
+			if len(accessCheckFunctions)-1 == i {
+				infofv2("[Gin-OAuth] %12v %s access not allowed", time.Since(t), ctx.Path())
+
+				return fiber.NewError(http.StatusForbidden, "access to the Resource is forbidden")
+			}
+		}
+
+		// without a single access check function there is nothing that
+		// can grant access, which the Gin implementation reported as an
+		// authorization check that ran into the VarianceTimer
+		return denyOvertime(ctx, t)
 	}
 }
 
@@ -357,25 +373,25 @@ func AuthChainOptions(o Options, accessCheckFunctions ...AccessCheckFunction) gi
 //		        TokenURL: "https://oauth2.corp.com/corp/oauth2/tokeninfo",
 //	     }
 //	     var acl []ginoauth2.AccessTuple = []ginoauth2.AccessTuple{{"employee", 1070, "sszuecs"}, {"employee", 1114, "njuettner"}}
-//	     router := gin.Default()
+//	     router := fiber.New()
 //	     router.Use(ginoauth2.RequestLogger([]string{"uid"}, "data"))
-func RequestLogger(keys []string, contentKey string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		request := c.Request
-		c.Next()
-		err := c.Errors
-		if request.Method != "GET" && err == nil {
-			if data, ok := c.Get(contentKey); !ok {
+func RequestLogger(keys []string, contentKey string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		method := c.Method()
+		err := c.Next()
+		if method != "GET" && err == nil {
+			if data := c.Locals(contentKey); data == nil {
 				values := make([]string, 0)
 				for _, key := range keys {
-					val, keyPresent := c.Get(key)
-					if keyPresent {
+					val := c.Locals(key)
+					if val != nil {
 						values = append(values, val.(string))
 					}
 				}
 				infof("[Gin-OAuth] Request: %+v for %s", data, strings.Join(values, "-"))
 			}
 		}
+		return err
 	}
 }
 

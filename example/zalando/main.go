@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/golang/glog"
-	ginglog "github.com/szuecs/gin-glog"
 	ginoauth2 "github.com/zalando/gin-oauth2"
 	"github.com/zalando/gin-oauth2/zalando"
 )
@@ -53,16 +54,16 @@ var SERVICES []zalando.AccessTuple = []zalando.AccessTuple{
 
 func main() {
 	flag.Parse()
-	router := gin.New()
-	router.Use(ginglog.Logger(3 * time.Second))
+	router := fiber.New()
+	router.Use(logger.New())
 	router.Use(ginoauth2.RequestLogger([]string{"uid"}, "data"))
-	router.Use(gin.Recovery())
+	router.Use(recover.New())
 
 	ginoauth2.VarianceTimer = 300 * time.Millisecond // defaults to 30s
 
 	public := router.Group("/api")
-	public.GET("/", func(c *gin.Context) {
-		c.JSON(200, gin.H{"message": "Hello to public world"})
+	public.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"message": "Hello to public world"})
 	})
 
 	private := router.Group("/api/private")
@@ -77,32 +78,32 @@ func main() {
 	//privateService.Use(ginoauth2.Auth(zalando.UidCheck(SERVICES), zalando.OAuth2Endpoint))
 	privateService.Use(ginoauth2.Auth(zalando.ScopeAndCheck("uidcheck", "uid", "bar"), zalando.OAuth2Endpoint))
 
-	private.GET("/", func(c *gin.Context) {
-		c.JSON(200, gin.H{"message": "Hello from private for groups and users"})
+	private.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"message": "Hello from private for groups and users"})
 	})
-	privateGroup.GET("/", func(c *gin.Context) {
-		uid, okUID := c.Get("uid")
-		if team, ok := c.Get("team"); ok && okUID {
-			c.JSON(200, gin.H{"message": fmt.Sprintf("Hello from private for groups to %s member of %s", uid, team)})
+	privateGroup.Get("/", func(c *fiber.Ctx) error {
+		uid := c.Locals("uid")
+		if team := c.Locals("team"); team != nil && uid != nil {
+			return c.JSON(fiber.Map{"message": fmt.Sprintf("Hello from private for groups to %s member of %s", uid, team)})
 		} else {
-			c.JSON(200, gin.H{"message": "Hello from private for groups without uid and team"})
+			return c.JSON(fiber.Map{"message": "Hello from private for groups without uid and team"})
 		}
 	})
-	privateUser.GET("/", func(c *gin.Context) {
-		if v, ok := c.Get("cn"); ok {
-			c.JSON(200, gin.H{"message": fmt.Sprintf("Hello from private for users to %s", v)})
+	privateUser.Get("/", func(c *fiber.Ctx) error {
+		if v := c.Locals("cn"); v != nil {
+			return c.JSON(fiber.Map{"message": fmt.Sprintf("Hello from private for users to %s", v)})
 		} else {
-			c.JSON(200, gin.H{"message": "Hello from private for users without cn"})
+			return c.JSON(fiber.Map{"message": "Hello from private for users without cn"})
 		}
 	})
-	privateService.GET("/", func(c *gin.Context) {
-		if v, ok := c.Get("cn"); ok {
-			c.JSON(200, gin.H{"message": fmt.Sprintf("Hello from private for services to %s", v)})
+	privateService.Get("/", func(c *fiber.Ctx) error {
+		if v := c.Locals("cn"); v != nil {
+			return c.JSON(fiber.Map{"message": fmt.Sprintf("Hello from private for services to %s", v)})
 		} else {
-			c.JSON(200, gin.H{"message": "Hello from private for services without cn"})
+			return c.JSON(fiber.Map{"message": "Hello from private for services without cn"})
 		}
 	})
 
 	glog.Info("bootstrapped application")
-	router.Run(":8081")
+	router.Listen(":8081")
 }

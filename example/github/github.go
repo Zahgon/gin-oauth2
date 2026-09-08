@@ -7,7 +7,9 @@ import (
 	"os"
 	"path"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/zalando/gin-oauth2/github"
 )
 
@@ -34,36 +36,38 @@ func main() {
 	}
 	secret := []byte("secret")
 	sessionName := "goquestsession"
-	router := gin.Default()
+	router := fiber.New()
+	router.Use(logger.New())
+	router.Use(recover.New())
 	// init settings for github auth
 	github.Setup(redirectURL, credFile, scopes, secret)
 	router.Use(github.Session(sessionName))
 
-	router.GET("/login", github.LoginHandler)
+	router.Get("/login", github.LoginHandler)
 
 	// protected url group
 	private := router.Group("/auth")
 	private.Use(github.Auth())
-	private.GET("/", UserInfoHandler)
-	private.GET("/api", func(ctx *gin.Context) {
-		ctx.JSON(200, gin.H{"message": "Hello from private for groups"})
+	private.Get("/", UserInfoHandler)
+	private.Get("/api", func(ctx *fiber.Ctx) error {
+		return ctx.JSON(fiber.Map{"message": "Hello from private for groups"})
 	})
 
-	router.Run("127.0.0.1:8081")
+	router.Listen("127.0.0.1:8081")
 }
 
-func UserInfoHandler(ctx *gin.Context) {
+func UserInfoHandler(ctx *fiber.Ctx) error {
 	var (
 		res github.AuthUser
 		val interface{}
 		ok  bool
 	)
 
-	val = ctx.MustGet("user")
+	val = ctx.Locals("user")
 	if res, ok = val.(github.AuthUser); !ok {
 		res = github.AuthUser{
 			Name: "no User",
 		}
 	}
-	ctx.JSON(http.StatusOK, gin.H{"Hello": "from private", "user": res})
+	return ctx.Status(http.StatusOK).JSON(fiber.Map{"Hello": "from private", "user": res})
 }

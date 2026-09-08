@@ -15,9 +15,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/session"
 	"github.com/golang/glog"
 	goauth "google.golang.org/api/oauth2/v2"
 	"google.golang.org/api/option"
@@ -35,11 +34,19 @@ type Credentials struct {
 const (
 	stateKey  = "state"
 	sessionID = "ginoauth_google_session"
+
+	// sessionContextKey is the key the Session() middleware uses to
+	// hand the session of the current request over to the handlers.
+	sessionContextKey = "ginoauth_google_session_ctx"
+
+	// defaultSessionName is the cookie name used until Session() rebinds
+	// the store to an application specific name.
+	defaultSessionName = "session_id"
 )
 
 var (
 	conf  *oauth2.Config
-	store sessions.Store
+	store *session.Store
 )
 
 func init() {
@@ -56,9 +63,31 @@ func randToken() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// Setup the authorization path
+// newStore creates a session store that reads the session id from the
+// cookie with the given name.
+func newStore(name string) *session.Store {
+	return session.New(session.Config{
+		KeyLookup:      "cookie:" + name,
+		CookieHTTPOnly: true,
+	})
+}
+
+// currentSession returns the session of the current request. It uses the
+// session provided by the Session() middleware, if it was registered.
+func currentSession(ctx *fiber.Ctx) (*session.Session, error) {
+	if s, ok := ctx.Locals(sessionContextKey).(*session.Session); ok {
+		return s, nil
+	}
+	return store.Get(ctx)
+}
+
+// Setup the authorization path.
+//
+// The secret is kept for API compatibility. Fiber's session middleware
+// stores the session data server side and references it by an
+// unguessable session id, so no signing secret is required.
 func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
-	store = cookie.NewStore(secret)
+	store = newStore(defaultSessionName)
 
 	var c Credentials
 	file, err := os.ReadFile(credFile)
@@ -80,7 +109,7 @@ func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
 
 // SetupFromString accepts string values for ouath2 Configs
 func SetupFromString(redirectURL, clientID string, clientSecret string, scopes []string, secret []byte) {
-	store = cookie.NewStore(secret)
+	store = newStore(defaultSessionName)
 
 	conf = &oauth2.Config{
 		ClientID:     clientID,
@@ -91,16 +120,33 @@ func SetupFromString(redirectURL, clientID string, clientSecret string, scopes [
 	}
 }
 
-func Session(name string) gin.HandlerFunc {
-	return sessions.Sessions(name, store)
+// Session returns a middleware that stores the session identified by the
+// cookie name in the request context, such that LoginHandler and Auth can
+// use it.
+func Session(name string) fiber.Handler {
+	store = newStore(name)
+
+	return func(ctx *fiber.Ctx) error {
+		sess, err := store.Get(ctx)
+		if err != nil {
+			return err
+		}
+		ctx.Locals(sessionContextKey, sess)
+
+		return ctx.Next()
+	}
 }
 
-func LoginHandler(ctx *gin.Context) {
+func LoginHandler(ctx *fiber.Ctx) error {
 	stateValue := randToken()
-	session := sessions.Default(ctx)
+	session, err := currentSession(ctx)
+	if err != nil {
+		return err
+	}
 	session.Set(stateKey, stateValue)
 	session.Save()
-	ctx.Writer.Write([]byte(`
+
+	return ctx.Type("html").SendString(`
 	<html>
 		<head>
 			<title>Golang Google</title>
@@ -110,7 +156,7 @@ func LoginHandler(ctx *gin.Context) {
 				<button>Login with Google!</button>
 			</a>
 		</body>
-	</html>`))
+	</html>`)
 }
 
 func GetLoginURL(state string) string {
@@ -131,74 +177,72 @@ func WithLoginURL(s string) error {
 // Example:
 //
 //	       private.Use(google.Auth())
-//	       private.GET("/", UserInfoHandler)
-//	       private.GET("/api", func(ctx *gin.Context) {
-//	           ctx.JSON(200, gin.H{"message": "Hello from private for groups"})
+//	       private.Get("/", UserInfoHandler)
+//	       private.Get("/api", func(ctx *fiber.Ctx) error {
+//	           return ctx.JSON(fiber.Map{"message": "Hello from private for groups"})
 //	       })
 //
 //	   // Requires google oauth pkg to be imported as `goauth "google.golang.org/api/oauth2/v2"`
-//	   func UserInfoHandler(ctx *gin.Context) {
+//	   func UserInfoHandler(ctx *fiber.Ctx) error {
 //		      var (
 //		      	res goauth.Userinfo
 //		      	ok  bool
 //		      )
 //
-//		      val := ctx.MustGet("user")
+//		      val := ctx.Locals("user")
 //		      if res, ok = val.(goauth.Userinfo); !ok {
 //		      	res = goauth.Userinfo{Name: "no user"}
 //		      }
 //
-//		      ctx.JSON(http.StatusOK, gin.H{"Hello": "from private", "user": res.Email})
+//		      return ctx.Status(http.StatusOK).JSON(fiber.Map{"Hello": "from private", "user": res.Email})
 //	   }
-func Auth() gin.HandlerFunc {
-	return func(ctx *gin.Context) {
+func Auth() fiber.Handler {
+	return func(ctx *fiber.Ctx) error {
 		// Handle the exchange code to initiate a transport.
-		session := sessions.Default(ctx)
+		session, err := currentSession(ctx)
+		if err != nil {
+			return err
+		}
 
 		existingSession := session.Get(sessionID)
 		if userInfo, ok := existingSession.(goauth.Userinfo); ok {
-			ctx.Set("user", userInfo)
-			ctx.Next()
-			return
+			ctx.Locals("user", userInfo)
+			return ctx.Next()
 		}
 
 		retrievedState := session.Get(stateKey)
 		if retrievedState != ctx.Query(stateKey) {
 			if loginURL != "" {
-				ctx.Redirect(302, loginURL)
-			} else {
-				ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("invalid session state: %s", retrievedState))
+				return ctx.Redirect(loginURL, http.StatusFound)
 			}
-			return
+			return fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("invalid session state: %s", retrievedState))
 		}
 
 		tok, err := conf.Exchange(context.TODO(), ctx.Query("code"))
 		if err != nil {
-			ctx.AbortWithError(http.StatusBadRequest, fmt.Errorf("failed to exchange code for oauth token: %w", err))
-			return
+			return fiber.NewError(http.StatusBadRequest, fmt.Sprintf("failed to exchange code for oauth token: %v", err))
 		}
 
-		oAuth2Service, err := goauth.NewService(ctx, option.WithTokenSource(conf.TokenSource(ctx, tok)))
+		oAuth2Service, err := goauth.NewService(ctx.UserContext(), option.WithTokenSource(conf.TokenSource(ctx.UserContext(), tok)))
 		if err != nil {
 			glog.Errorf("[Gin-OAuth] Failed to create oauth service: %v", err)
-			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to create oauth service: %w", err))
-			return
+			return fiber.NewError(http.StatusInternalServerError, fmt.Sprintf("failed to create oauth service: %v", err))
 		}
 
 		userInfo, err := oAuth2Service.Userinfo.Get().Do()
 		if err != nil {
 			glog.Errorf("[Gin-OAuth] Failed to get userinfo for user: %v", err)
-			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to get userinfo for user: %w", err))
-			return
+			return fiber.NewError(http.StatusInternalServerError, fmt.Sprintf("failed to get userinfo for user: %v", err))
 		}
 
-		ctx.Set("user", userInfo)
+		ctx.Locals("user", userInfo)
 
 		session.Set(sessionID, userInfo)
 		if err := session.Save(); err != nil {
 			glog.Errorf("[Gin-OAuth] Failed to save session: %v", err)
-			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to save session: %v", err))
-			return
+			return fiber.NewError(http.StatusInternalServerError, fmt.Sprintf("failed to save session: %v", err))
 		}
+
+		return ctx.Next()
 	}
 }
